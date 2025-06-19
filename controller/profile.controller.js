@@ -1,85 +1,70 @@
 const express = require("express");
-const auth = require("../middleware/auth.middleware.js");
-const upload = require("../middleware/upload.middleware.js");
-const Profile = require("../model/profile.model.js");
-
+const auth = require("../middleware/auth.middleware");
+const upload = require("../middleware/upload.middleware");
+const Profile = require("../model/profile.model");
+const NodeCache = require("node-cache");
+const multer = require("multer");
 const router = express.Router();
 
-// ✅ GET current user's profile
+// 5 min cache
+const profileCache = new NodeCache({ stdTTL: 300 });
+
+// GET Profile
 router.get("/", auth, async (req, res) => {
   try {
+    const cacheKey = `profile_${req.user._id}`;
+    const cached = profileCache.get(cacheKey);
+
+    if (cached) return res.status(200).json({ profile: cached });
+
     const profile = await Profile.findOne({ userId: req.user._id });
 
-    if (!profile) {
-      return res.status(404).json({ message: "Profile not found!" });
-    }
+    if (!profile) return res.status(404).json({ message: "Profile not found!" });
 
+    profileCache.set(cacheKey, profile);
     return res.status(200).json({ profile });
-  } catch (error) {
-    console.error("GET Profile Error:", error);
-    return res.status(500).json({ message: "Error fetching profile", error });
+  } catch (err) {
+    console.error("GET Profile Error:", err);
+    return res.status(500).json({ message: "Server error" });
   }
 });
 
-// ✅ CREATE profile (1 profile per user)
-router.post("/create", auth, upload.single("profileImage"), async (req, res) => {
+// POST/UPDATE Profile
+router.post("/save", auth, upload.single("profileImage"), async (req, res) => {
   try {
     const { fullname, bio } = req.body;
-    const userId = req.user._id;
 
-    if (!fullname || !bio || !req.file) {
-      return res.status(400).json({ message: "Fullname, bio, and image are required." });
+    if (!fullname || !bio) {
+      return res.status(400).json({ message: "Fullname and bio are required" });
     }
 
-    // 🔒 Check if profile already exists for this user
-    const existingProfile = await Profile.findOne({ userId });
-    if (existingProfile) {
-      return res.status(409).json({ message: "Profile already exists for this user." });
-    }
-
-    const newProfile = new Profile({
-      userId,
+    const profileData = {
+      userId: req.user._id,
       fullname,
       bio,
-      imageUrl: req.file.path,
-    });
+      ...(req.file && { imageUrl: req.file.path })
+    };
 
-    const savedProfile = await newProfile.save();
-    return res.status(201).json({ message: "Profile created successfully", profile: savedProfile });
-  } catch (error) {
-    console.error("Create Profile Error:", error);
-    return res.status(500).json({ message: "Error creating profile", error });
-  }
-});
+    const profile = await Profile.findOneAndUpdate(
+      { userId: req.user._id },
+      profileData,
+      { new: true, upsert: true, runValidators: true }
+    );
 
-// ✅ UPDATE profile by ID
-router.patch("/update/:id", auth, upload.single("profileImage"), async (req, res) => {
-  try {
-    const { fullname, bio } = req.body;
-    const profileId = req.params.id;
-    const userId = req.user._id;
+    profileCache.del(`profile_${req.user._id}`);
 
-    const existingProfile = await Profile.findById(profileId);
+    return res.status(201).json({ message: "Profile saved", profile });
+  } catch (err) {
+    console.error("Save Profile Error:", err);
 
-    if (!existingProfile) {
-      return res.status(404).json({ message: "Profile not found." });
+    if (err instanceof multer.MulterError) {
+      if (err.code === "LIMIT_FILE_SIZE") {
+        return res.status(400).json({ message: "Image exceeds 1MB limit" });
+      }
+      return res.status(400).json({ message: "File upload error", error: err.message });
     }
 
-    // 🔐 Check ownership
-    if (existingProfile.userId.toString() !== userId.toString()) {
-      return res.status(403).json({ message: "Unauthorized to update this profile." });
-    }
-
-    // ✅ Update fields
-    if (fullname) existingProfile.fullname = fullname;
-    if (bio) existingProfile.bio = bio;
-    if (req.file) existingProfile.imageUrl = req.file.path;
-
-    const updatedProfile = await existingProfile.save();
-    return res.status(200).json({ message: "Profile updated successfully", profile: updatedProfile });
-  } catch (error) {
-    console.error("Update Profile Error:", error);
-    return res.status(500).json({ message: "Error updating profile", error });
+    return res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
